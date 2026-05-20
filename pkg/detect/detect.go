@@ -72,29 +72,69 @@ func parseConfig(contents string) (map[string][]string, error) {
 	return result, nil
 }
 
-var notMaster = regexp.MustCompile(`ts2phc.master\s+0`)
+var (
+	notMaster     = regexp.MustCompile(`ts2phc.master\s+0`)
+	ptpDevicePath = regexp.MustCompile(`^/dev/ptp[0-9]+$`)
+)
 
-func getPTPClockDevice(ctx clients.ExecContext, interfaceName string) (string, error) {
-	out, _, err := ctx.ExecCommand([]string{"ethtool", "-T", interfaceName})
-	if err != nil {
-		return "", fmt.Errorf("failed to get ptp clock number: %w", err)
+var errNoPTPClockDevice = errors.New("no PTP clock device found")
+
+func isSkippedConfigSection(section string) bool {
+	switch strings.ToLower(strings.TrimSpace(section)) {
+	case "global", "nmea":
+		return true
+	default:
+		return false
 	}
-	for _, line := range strings.Split(out, "\n") {
+}
+
+func resolvePTPClockDevicePath(section string) string {
+	section = strings.TrimSpace(section)
+	if ptpDevicePath.MatchString(section) {
+		return section
+	}
+	return ""
+}
+
+func ptpClockFromEthtool(output string) (string, error) {
+	for _, line := range strings.Split(output, "\n") {
 		if strings.Contains(line, "PTP Hardware Clock:") {
 			clockNumber := strings.TrimSpace(strings.Split(line, ":")[1])
 			return fmt.Sprintf("/dev/ptp%s", clockNumber), nil
 		}
 	}
-	return "", errors.New("no PTP clock device found")
+	return "", errNoPTPClockDevice
+}
+
+func getPTPClockDevice(ctx clients.ExecContext, interfaceName string) (string, error) {
+	if ptpDev := resolvePTPClockDevicePath(interfaceName); ptpDev != "" {
+		return ptpDev, nil
+	}
+
+	out, _, err := ctx.ExecCommand([]string{"ethtool", "-T", interfaceName})
+	if err != nil {
+		return "", fmt.Errorf("failed to get ptp clock number for %q: %w", interfaceName, err)
+	}
+	ptpDev, err := ptpClockFromEthtool(out)
+	if err != nil {
+		return "", fmt.Errorf("%w for %q", err, interfaceName)
+	}
+	return ptpDev, nil
+}
+
+func netdevExists(ctx clients.ExecContext, interfaceName string) bool {
+	_, _, err := ctx.ExecCommand([]string{"test", "-e", "/sys/class/net/" + interfaceName})
+	return err == nil
 }
 
 func getDetectedInterfaces(ctx clients.ExecContext, config map[string][]string) []DetectedInterface {
 	detected := []DetectedInterface{}
 	for section, lines := range config {
-		if section == "global" || section == "nmea" { //nolint:goconst // only one time so const would obfuscate
+		if isSkippedConfigSection(section) {
 			continue
 		}
 
+		section = strings.TrimSpace(section)
 		isPrimary := true
 		for _, l := range lines {
 			if notMaster.MatchString(l) {
@@ -103,10 +143,24 @@ func getDetectedInterfaces(ctx clients.ExecContext, config map[string][]string) 
 		}
 
 		ptpDev, err := getPTPClockDevice(ctx, section)
-		utils.IfErrorExitOrPanic(err)
+		if err != nil {
+			if !isPrimary && netdevExists(ctx, section) {
+				log.Warnf(
+					"section %q has no PHC via ethtool; including for DPLL collection only",
+					section,
+				)
+				detected = append(detected, DetectedInterface{
+					Name:    section,
+					Primary: false,
+				})
+				continue
+			}
+			log.Warnf("skipping ts2phc section %q: %v", section, err)
+			continue
+		}
 
 		detected = append(detected, DetectedInterface{
-			Name:               strings.TrimSpace(section),
+			Name:               section,
 			Primary:            isPrimary,
 			PTPClockDevicePath: ptpDev,
 		})
@@ -143,6 +197,9 @@ func checkTs2PhcConfig(ctx clients.ExecContext) ([]DetectedInterface, error) { /
 		}
 
 		detected = append(detected, getDetectedInterfaces(ctx, config)...)
+	}
+	if len(detected) == 0 {
+		errs = append(errs, errors.New("no PTP-capable interfaces detected from ts2phc config"))
 	}
 	return detected, utils.MakeCompositeError("", errs) //nolint:wrapcheck //this just combines errors.
 }
