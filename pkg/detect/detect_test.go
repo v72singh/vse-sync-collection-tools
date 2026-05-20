@@ -104,24 +104,69 @@ ts2phc.master 0
 func TestGnrdTs2phcConfigParsing(t *testing.T) {
 	t.Parallel()
 
-	config, err := parseConfig(gnrdTs2phcConfig)
+	config, netdevOrder, err := parseConfigWithOrder(gnrdTs2phcConfig)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !nmeaSectionIsMaster(config) {
 		t.Fatal("expected [nmea] to be ts2phc master")
 	}
-	for _, iface := range []string{"eno8703np0", "enp108s0f0np0", "enp110s0f0np0"} {
+	wantOrder := []string{"eno8703np0", "enp108s0f0np0", "enp110s0f0np0"}
+	if len(netdevOrder) != len(wantOrder) {
+		t.Fatalf("netdev order %v, want %v", netdevOrder, wantOrder)
+	}
+	for i := range wantOrder {
+		if netdevOrder[i] != wantOrder[i] {
+			t.Fatalf("netdev order[%d]=%s want %s", i, netdevOrder[i], wantOrder[i])
+		}
+	}
+	for _, iface := range wantOrder {
 		if sectionHasTs2phcMaster(config[iface]) {
 			t.Fatalf("%s should not be master", iface)
 		}
 	}
 }
 
+func TestFillMissingPTPDevices(t *testing.T) {
+	t.Parallel()
+
+	config, netdevOrder, err := parseConfigWithOrder(gnrdTs2phcConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	detected := []DetectedInterface{
+		{Name: "eno8703np0", Primary: true},
+		{Name: "enp108s0f0np0"},
+		{Name: "enp110s0f0np0"},
+	}
+	result := fillMissingPTPDevices(detected, netdevOrder, true)
+	if result[0].PTPClockDevicePath != "/dev/ptp0" {
+		t.Fatalf("eno8703np0 got %q", result[0].PTPClockDevicePath)
+	}
+	if result[1].PTPClockDevicePath != "/dev/ptp1" {
+		t.Fatalf("enp108 got %q", result[1].PTPClockDevicePath)
+	}
+	if result[2].PTPClockDevicePath != "/dev/ptp2" {
+		t.Fatalf("enp110 got %q", result[2].PTPClockDevicePath)
+	}
+	if !nmeaSectionIsMaster(config) {
+		t.Fatal("expected nmea master for fill test")
+	}
+}
+
+func TestPtpIndexFromTs2phcSinkLine(t *testing.T) {
+	t.Parallel()
+
+	match := ts2phcSinkPTPIndex.FindStringSubmatch("PPS sink eno8703np0 has ptp index 0")
+	if len(match) < 2 || match[1] != "0" {
+		t.Fatalf("unexpected match %v", match)
+	}
+}
+
 func TestApplyNmeaMasterPrimary(t *testing.T) {
 	t.Parallel()
 
-	config, err := parseConfig(gnrdTs2phcConfig)
+	config, _, err := parseConfigWithOrder(gnrdTs2phcConfig)
 	if err != nil {
 		t.Fatal(err)
 	}

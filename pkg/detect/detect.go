@@ -27,7 +27,11 @@ type DetectedInterface struct {
 }
 
 // DetectVersion is logged at startup so runs can confirm the image includes GNRD detect fixes.
-const DetectVersion = "20260520-gnrd-nmea-master"
+const DetectVersion = "20260520-gnrd-nmea-master-v2"
+
+var (
+	ts2phcSinkPTPIndex = regexp.MustCompile(`PPS sink .+ has ptp index ([0-9]+)`)
+)
 
 func sortAndDeduplicateInterfaces(interfaces []DetectedInterface) []DetectedInterface {
 	if len(interfaces) == 0 {
@@ -69,7 +73,12 @@ func exitOnDetectError(err error) {
 	os.Exit(1)
 }
 
+func initDetectLogging() {
+	log.SetOutput(os.Stderr)
+}
+
 func Detect(kubeConfig, ptpNodeName string, outputAsJSON bool) {
+	initDetectLogging()
 	log.Infof("detect %s", DetectVersion)
 	clientset, err := clients.GetClientset(kubeConfig)
 	exitOnDetectError(err)
@@ -93,9 +102,15 @@ func output(outWriter io.Writer, interfaces []DetectedInterface, outputAsJSON bo
 }
 
 func parseConfig(contents string) (map[string][]string, error) {
+	config, _, err := parseConfigWithOrder(contents)
+	return config, err
+}
+
+func parseConfigWithOrder(contents string) (map[string][]string, []string, error) {
 	scanner := bufio.NewScanner(strings.NewReader(contents))
 	var currentSection string
 	result := make(map[string][]string)
+	var netdevSections []string
 
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
@@ -105,6 +120,9 @@ func parseConfig(contents string) (map[string][]string, error) {
 		}
 		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
 			currentSection = line[1 : len(line)-1]
+			if !isSkippedConfigSection(currentSection) {
+				netdevSections = append(netdevSections, strings.TrimSpace(currentSection))
+			}
 			continue
 		} else if currentSection != "" {
 			result[currentSection] = append(result[currentSection], line)
@@ -112,9 +130,9 @@ func parseConfig(contents string) (map[string][]string, error) {
 	}
 
 	if err := scanner.Err(); err != nil {
-		return result, fmt.Errorf("failed when parsing ts2phc config: %w", err)
+		return result, netdevSections, fmt.Errorf("failed when parsing ts2phc config: %w", err)
 	}
-	return result, nil
+	return result, netdevSections, nil
 }
 
 var (
@@ -211,10 +229,60 @@ func getPTPClockDevice(ctx clients.ExecContext, interfaceName string) (string, e
 		return ptpDev, nil
 	}
 
+	ptpDev, sinkErr := getPTPClockFromTs2phcSink(ctx, interfaceName)
+	if sinkErr == nil {
+		return ptpDev, nil
+	}
+
 	if err != nil {
 		return "", fmt.Errorf("failed to get ptp clock number for %q: %w", interfaceName, err)
 	}
 	return "", fmt.Errorf("%w for %q", errNoPTPClockDevice, interfaceName)
+}
+
+func getPTPClockFromTs2phcSink(ctx clients.ExecContext, interfaceName string) (string, error) {
+	script := `iface=` + interfaceName + `
+for f in /var/log/* /var/log/linuxptp*/* /var/log/containers/* 2>/dev/null; do
+  [ -r "$f" ] || continue
+  line=$(grep -m1 "PPS sink ${iface} has ptp index" "$f" 2>/dev/null) && echo "$line" && exit 0
+done
+exit 1`
+	out, _, err := ctx.ExecCommand([]string{"sh", "-c", script})
+	if err != nil {
+		return "", err
+	}
+	match := ts2phcSinkPTPIndex.FindStringSubmatch(strings.TrimSpace(out))
+	if len(match) < 2 || !isValidPTPClockIndex(match[1]) {
+		return "", errNoPTPClockDevice
+	}
+	return "/dev/ptp" + match[1], nil
+}
+
+func fillMissingPTPDevices(
+	detected []DetectedInterface,
+	netdevOrder []string,
+	nmeaMaster bool,
+) []DetectedInterface {
+	if !nmeaMaster {
+		return detected
+	}
+	for i := range detected {
+		if detected[i].PTPClockDevicePath != "" {
+			continue
+		}
+		for idx, name := range netdevOrder {
+			if name == detected[i].Name {
+				detected[i].PTPClockDevicePath = fmt.Sprintf("/dev/ptp%d", idx)
+				log.Infof(
+					"assigned %q -> %s from ts2phc netdev section order",
+					detected[i].Name,
+					detected[i].PTPClockDevicePath,
+				)
+				break
+			}
+		}
+	}
+	return detected
 }
 
 func netdevExists(ctx clients.ExecContext, interfaceName string) bool {
@@ -327,11 +395,16 @@ func appendDetectedInterface(
 	})
 }
 
-func getDetectedInterfaces(ctx clients.ExecContext, config map[string][]string) []DetectedInterface {
+func getDetectedInterfaces(
+	ctx clients.ExecContext,
+	config map[string][]string,
+	netdevOrder []string,
+) []DetectedInterface {
 	detected := []DetectedInterface{}
 	nmeaMaster := nmeaSectionIsMaster(config)
 
-	for section, lines := range config {
+	for _, section := range netdevOrder {
+		lines := config[section]
 		detected = appendDetectedInterface(detected, ctx, section, lines, func(ls []string) bool {
 			if nmeaMaster {
 				return false
@@ -344,6 +417,8 @@ func getDetectedInterfaces(ctx clients.ExecContext, config map[string][]string) 
 			return true
 		}, nmeaMaster)
 	}
+
+	detected = fillMissingPTPDevices(detected, netdevOrder, nmeaMaster)
 
 	return applyNmeaMasterPrimary(ctx, detected, config)
 }
@@ -382,12 +457,12 @@ func checkTs2PhcConfig(ctx clients.ExecContext) ([]DetectedInterface, error) { /
 		if err != nil {
 			errs = append(errs, fmt.Errorf("failed to read ts2 config file: %w", err))
 		}
-		config, err := parseConfig(ts2phcConfig)
+		config, netdevOrder, err := parseConfigWithOrder(ts2phcConfig)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("failed to parse ts2 config file: %w", err))
 		}
 
-		detected = append(detected, getDetectedInterfaces(ctx, config)...)
+		detected = append(detected, getDetectedInterfaces(ctx, config, netdevOrder)...)
 	}
 
 	detected = sortAndDeduplicateInterfaces(detected)
