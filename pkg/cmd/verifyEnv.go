@@ -32,4 +32,5 @@ func init() {
 	AddFormatFlag(verifyEnvCmd)
 	AddInterfaceFlag(verifyEnvCmd)
 	AddNodeNameFlag(verifyEnvCmd)
+	AddClockTypeFlag(verifyEnvCmd)
 }

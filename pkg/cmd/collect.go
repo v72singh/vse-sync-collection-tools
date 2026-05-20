@@ -111,6 +111,7 @@ func init() { //nolint:funlen // Allow this to get a little long
 	AddFormatFlag(collectCmd)
 	AddInterfaceFlag(collectCmd)
 	AddNodeNameFlag(collectCmd)
+	AddClockTypeFlag(collectCmd)
 
 	collectCmd.Flags().StringVarP(
 		&requestedDurationStr,

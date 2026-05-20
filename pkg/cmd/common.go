@@ -14,6 +14,7 @@ var (
 	useAnalyserJSON bool
 	ptpInterface    string
 	nodeName        string
+	clockType       string
 )
 
 func AddKubeconfigFlag(targetCmd *cobra.Command) {
@@ -56,4 +57,15 @@ func AddNodeNameFlag(targetCmd *cobra.Command) {
 		"nodeName",
 		"n", "",
 		"Name of the Node under test (valid only for MNO Use case)")
+}
+
+// AddClockTypeFlag registers --clock-type for compatibility with vse-sync-test e2e.sh.
+// On varuncollector-tool, detect always uses ts2phc; collect/verify ignore this today.
+func AddClockTypeFlag(targetCmd *cobra.Command) {
+	targetCmd.Flags().StringVarP(&clockType,
+		"clock-type",
+		"c",
+		"gm",
+		"Clock role under test: gm (T-GM) or bc (boundary clock)",
+	)
 }

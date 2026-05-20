@@ -23,4 +23,5 @@ func init() {
 	AddKubeconfigFlag(detectCards)
 	AddFormatFlag(detectCards)
 	AddNodeNameFlag(detectCards)
+	AddClockTypeFlag(detectCards)
 }
