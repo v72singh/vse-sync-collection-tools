@@ -66,13 +66,22 @@ func sortAndDeduplicateInterfaces(interfaces []DetectedInterface) []DetectedInte
 	return deduplicated
 }
 
+func exitOnDetectError(err error) {
+	if err == nil {
+		return
+	}
+	log.Error(err)
+	os.Exit(1)
+}
+
 func Detect(kubeConfig, ptpNodeName string, outputAsJSON bool, clockType string) {
+	log.Infof("detect %s (clock-type=%s)", DetectVersion, clockType)
 	clientset, err := clients.GetClientset(kubeConfig)
-	utils.IfErrorExitOrPanic(err)
+	exitOnDetectError(err)
 	ctx, err := contexts.GetPTPDaemonContext(clientset, ptpNodeName)
-	utils.IfErrorExitOrPanic(err)
+	exitOnDetectError(err)
 	interfaces, err := checkPTPConfig(ctx, clockType)
-	utils.IfErrorExitOrPanic(err)
+	exitOnDetectError(err)
 	output(os.Stdout, interfaces, outputAsJSON)
 }
 
@@ -128,6 +137,9 @@ var (
 
 var errNoPTPClockDevice = errors.New("no PTP clock device found")
 
+// DetectVersion is logged at startup so runs can confirm the image includes GNRD detect fixes.
+const DetectVersion = "20260520-gnrd-nmea-master"
+
 func isSkippedConfigSection(section string) bool {
 	switch strings.ToLower(strings.TrimSpace(section)) {
 	case "global", "nmea":
@@ -170,19 +182,30 @@ func ptpClockFromEthtool(output string) (string, error) {
 }
 
 func getPTPClockDeviceFromSysfs(ctx clients.ExecContext, interfaceName string) (string, error) {
-	out, _, err := ctx.ExecCommand([]string{"readlink", "-f", "/sys/class/net/" + interfaceName + "/device/ptp"})
+	// ice and other drivers expose PHC under device/ptp or device/ptp/ptpN; also allow reverse lookup.
+	script := `iface=` + interfaceName + `
+for candidate in /sys/class/net/${iface}/device/ptp /sys/class/net/${iface}/device/ptp/ptp*; do
+  if [ -e "$candidate" ]; then
+    name=$(basename "$(readlink -f "$candidate")")
+    case "$name" in ptp*) echo "/dev/$name"; exit 0 ;; esac
+  fi
+done
+for ptpdir in /sys/class/ptp/ptp*/; do
+  if [ -e "${ptpdir}device/net/${iface}" ]; then
+    echo "/dev/$(basename "$ptpdir")"
+    exit 0
+  fi
+done
+exit 1`
+	out, _, err := ctx.ExecCommand([]string{"sh", "-c", script})
 	if err != nil {
 		return "", err
 	}
-	base := strings.TrimSpace(out)
-	if base == "" {
+	ptpDev := strings.TrimSpace(out)
+	if ptpDev == "" || !ptpDevicePath.MatchString(ptpDev) {
 		return "", errNoPTPClockDevice
 	}
-	ptpName := base[strings.LastIndex(base, "/")+1:]
-	if !strings.HasPrefix(ptpName, "ptp") {
-		return "", errNoPTPClockDevice
-	}
-	return "/dev/" + ptpName, nil
+	return ptpDev, nil
 }
 
 func getPTPClockDevice(ctx clients.ExecContext, interfaceName string) (string, error) {
@@ -294,6 +317,7 @@ func appendDetectedInterface(
 	section string,
 	lines []string,
 	isPrimary func([]string) bool,
+	nmeaMaster bool,
 ) []DetectedInterface {
 	section = strings.TrimSpace(section)
 	if isSkippedConfigSection(section) {
@@ -303,14 +327,15 @@ func appendDetectedInterface(
 	primary := isPrimary(lines)
 	ptpDev, err := getPTPClockDevice(ctx, section)
 	if err != nil {
-		if !primary && netdevExists(ctx, section) {
+		// GNRD profiles list extts netdevs in ts2phc; include them even when PHC lookup fails.
+		if nmeaMaster || (!primary && netdevExists(ctx, section)) {
 			log.Warnf(
-				"section %q has no PHC via ethtool/sysfs; including for DPLL collection only",
-				section,
+				"section %q: %v; including netdev from ts2phc config",
+				section, err,
 			)
 			return append(detected, DetectedInterface{
 				Name:    section,
-				Primary: false,
+				Primary: primary,
 			})
 		}
 		log.Warnf("skipping section %q: %v", section, err)
@@ -340,7 +365,7 @@ func getDetectedInterfaces(ctx clients.ExecContext, config map[string][]string) 
 				}
 			}
 			return true
-		})
+		}, nmeaMaster)
 	}
 
 	detected = applyNmeaMasterPrimary(ctx, detected, config)
@@ -423,7 +448,7 @@ func getDetectedInterfacesFromPtp4l(ctx clients.ExecContext, config map[string][
 				}
 			}
 			return true
-		})
+		}, false)
 	}
 
 	return sortAndDeduplicateInterfaces(detected)
