@@ -50,8 +50,12 @@ func sortAndDeduplicateInterfaces(interfaces []DetectedInterface) []DetectedInte
 	})
 
 	for _, iface := range interfaces {
-		if !seen[iface.PTPClockDevicePath] {
-			seen[iface.PTPClockDevicePath] = true
+		key := iface.PTPClockDevicePath
+		if key == "" {
+			key = iface.Name
+		}
+		if !seen[key] {
+			seen[key] = true
 			deduplicated = append(deduplicated, iface)
 		} else {
 			log.Infof("Deduplicating interface %s with PTP device %s (already seen)",
@@ -114,53 +118,153 @@ func parseConfig(contents string) (map[string][]string, error) {
 	return result, nil
 }
 
-var ts2phcNotMaster = regexp.MustCompile(`ts2phc.master\s+0`)
-var ptp4lMasterOnly = regexp.MustCompile(`masterOnly\s+1`)
-var ptp4lServerOnly = regexp.MustCompile(`serverOnly\s+1`)
+var (
+	ts2phcNotMaster = regexp.MustCompile(`ts2phc.master\s+0`)
+	ptp4lMasterOnly = regexp.MustCompile(`masterOnly\s+1`)
+	ptp4lServerOnly = regexp.MustCompile(`serverOnly\s+1`)
+	ptpDevicePath   = regexp.MustCompile(`^/dev/ptp[0-9]+$`)
+)
 
-func getPTPClockDevice(ctx clients.ExecContext, interfaceName string) (string, error) {
-	out, _, err := ctx.ExecCommand([]string{"ethtool", "-T", interfaceName})
-	if err != nil {
-		return "", fmt.Errorf("failed to get ptp clock number: %w", err)
+var errNoPTPClockDevice = errors.New("no PTP clock device found")
+
+func isSkippedConfigSection(section string) bool {
+	switch strings.ToLower(strings.TrimSpace(section)) {
+	case "global", "nmea":
+		return true
+	default:
+		return false
 	}
+}
 
-	for line := range strings.SplitSeq(out, "\n") {
+func resolvePTPClockDevicePath(section string) string {
+	section = strings.TrimSpace(section)
+	if ptpDevicePath.MatchString(section) {
+		return section
+	}
+	return ""
+}
+
+func isValidPTPClockIndex(clockNumber string) bool {
+	if clockNumber == "" || clockNumber == "none" || clockNumber == "unknown" {
+		return false
+	}
+	for _, c := range clockNumber {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func ptpClockFromEthtool(output string) (string, error) {
+	for line := range strings.SplitSeq(output, "\n") {
 		if strings.Contains(line, "PTP Hardware Clock:") {
 			clockNumber := strings.TrimSpace(strings.Split(line, ":")[1])
-			return "/dev/ptp" + clockNumber, nil
+			if isValidPTPClockIndex(clockNumber) {
+				return "/dev/ptp" + clockNumber, nil
+			}
+		}
+	}
+	return "", errNoPTPClockDevice
+}
+
+func getPTPClockDeviceFromSysfs(ctx clients.ExecContext, interfaceName string) (string, error) {
+	out, _, err := ctx.ExecCommand([]string{"readlink", "-f", "/sys/class/net/" + interfaceName + "/device/ptp"})
+	if err != nil {
+		return "", err
+	}
+	base := strings.TrimSpace(out)
+	if base == "" {
+		return "", errNoPTPClockDevice
+	}
+	ptpName := base[strings.LastIndex(base, "/")+1:]
+	if !strings.HasPrefix(ptpName, "ptp") {
+		return "", errNoPTPClockDevice
+	}
+	return "/dev/" + ptpName, nil
+}
+
+func getPTPClockDevice(ctx clients.ExecContext, interfaceName string) (string, error) {
+	interfaceName = strings.TrimSpace(interfaceName)
+	if ptpDev := resolvePTPClockDevicePath(interfaceName); ptpDev != "" {
+		return ptpDev, nil
+	}
+
+	out, _, err := ctx.ExecCommand([]string{"ethtool", "-T", interfaceName})
+	if err == nil {
+		ptpDev, err := ptpClockFromEthtool(out)
+		if err == nil {
+			return ptpDev, nil
 		}
 	}
 
-	return "", errors.New("no PTP clock device found")
+	ptpDev, sysfsErr := getPTPClockDeviceFromSysfs(ctx, interfaceName)
+	if sysfsErr == nil {
+		return ptpDev, nil
+	}
+
+	if err != nil {
+		return "", fmt.Errorf("failed to get ptp clock number for %q: %w", interfaceName, err)
+	}
+	return "", fmt.Errorf("%w for %q", errNoPTPClockDevice, interfaceName)
+}
+
+func netdevExists(ctx clients.ExecContext, interfaceName string) bool {
+	_, _, err := ctx.ExecCommand([]string{"test", "-e", "/sys/class/net/" + interfaceName})
+	return err == nil
+}
+
+func appendDetectedInterface(
+	detected []DetectedInterface,
+	ctx clients.ExecContext,
+	section string,
+	lines []string,
+	isPrimary func([]string) bool,
+) []DetectedInterface {
+	section = strings.TrimSpace(section)
+	if isSkippedConfigSection(section) {
+		return detected
+	}
+
+	primary := isPrimary(lines)
+	ptpDev, err := getPTPClockDevice(ctx, section)
+	if err != nil {
+		if !primary && netdevExists(ctx, section) {
+			log.Warnf(
+				"section %q has no PHC via ethtool/sysfs; including for DPLL collection only",
+				section,
+			)
+			return append(detected, DetectedInterface{
+				Name:    section,
+				Primary: false,
+			})
+		}
+		log.Warnf("skipping section %q: %v", section, err)
+		return detected
+	}
+
+	return append(detected, DetectedInterface{
+		Name:               section,
+		Primary:            primary,
+		PTPClockDevicePath: ptpDev,
+	})
 }
 
 func getDetectedInterfaces(ctx clients.ExecContext, config map[string][]string) []DetectedInterface {
 	detected := []DetectedInterface{}
 
 	for section, lines := range config {
-		if section == "global" || section == "nmea" { //nolint:goconst // only one time so const would obfuscate
-			continue
-		}
-
-		isPrimary := true
-
-		for _, l := range lines {
-			if ts2phcNotMaster.MatchString(l) {
-				isPrimary = false
+		detected = appendDetectedInterface(detected, ctx, section, lines, func(ls []string) bool {
+			for _, l := range ls {
+				if ts2phcNotMaster.MatchString(l) {
+					return false
+				}
 			}
-		}
-
-		ptpDev, err := getPTPClockDevice(ctx, section)
-		utils.IfErrorExitOrPanic(err)
-
-		detected = append(detected, DetectedInterface{
-			Name:               strings.TrimSpace(section),
-			Primary:            isPrimary,
-			PTPClockDevicePath: ptpDev,
+			return true
 		})
 	}
 
-	return detected
+	return sortAndDeduplicateInterfaces(detected)
 }
 
 func checkPTPConfig(ctx clients.ExecContext, clockType string) ([]DetectedInterface, error) {
@@ -231,29 +335,13 @@ func getDetectedInterfacesFromPtp4l(ctx clients.ExecContext, config map[string][
 	detected := []DetectedInterface{}
 
 	for section, lines := range config {
-		if section == "global" || section == "nmea" { //nolint:goconst // only one time so const would obfuscate
-			continue
-		}
-
-		// For BC clocks, all interfaces are primary (they participate in PTP sync)
-		isPrimary := true
-
-		for _, l := range lines {
-			if ptp4lMasterOnly.MatchString(l) || ptp4lServerOnly.MatchString(l) {
-				isPrimary = false
+		detected = appendDetectedInterface(detected, ctx, section, lines, func(ls []string) bool {
+			for _, l := range ls {
+				if ptp4lMasterOnly.MatchString(l) || ptp4lServerOnly.MatchString(l) {
+					return false
+				}
 			}
-		}
-
-		ptpDev, err := getPTPClockDevice(ctx, section)
-		if err != nil {
-			log.Warnf("Failed to get PTP clock device for interface %s: %v", section, err)
-			continue
-		}
-
-		detected = append(detected, DetectedInterface{
-			Name:               strings.TrimSpace(section),
-			Primary:            isPrimary,
-			PTPClockDevicePath: ptpDev,
+			return true
 		})
 	}
 
@@ -295,6 +383,11 @@ func checkTs2PhcConfig(ctx clients.ExecContext) ([]DetectedInterface, error) { /
 		}
 
 		detected = append(detected, getDetectedInterfaces(ctx, config)...)
+	}
+
+	detected = sortAndDeduplicateInterfaces(detected)
+	if len(detected) == 0 {
+		errs = append(errs, errors.New("no PTP-capable interfaces detected from ts2phc config"))
 	}
 
 	return detected, utils.MakeCompositeError("", errs) //nolint:wrapcheck //this just combines errors.
