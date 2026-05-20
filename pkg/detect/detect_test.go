@@ -70,3 +70,67 @@ func TestIsValidPTPClockIndex(t *testing.T) {
 		t.Fatal("non-numeric indices should be invalid")
 	}
 }
+
+const gnrdTs2phcConfig = `#profile: gnrd-tgm_grandmaster
+
+[nmea]
+ts2phc.master 1
+[global]
+use_syslog 0
+[eno8703np0]
+ts2phc.master 0
+[enp108s0f0np0]
+ts2phc.master 0
+[enp110s0f0np0]
+ts2phc.master 0
+`
+
+func TestGnrdTs2phcConfigParsing(t *testing.T) {
+	t.Parallel()
+
+	config, err := parseConfig(gnrdTs2phcConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !nmeaSectionIsMaster(config) {
+		t.Fatal("expected [nmea] to be ts2phc master")
+	}
+	for _, iface := range []string{"eno8703np0", "enp108s0f0np0", "enp110s0f0np0"} {
+		if sectionHasTs2phcMaster(config[iface]) {
+			t.Fatalf("%s should not be master", iface)
+		}
+	}
+}
+
+func TestApplyNmeaMasterPrimary(t *testing.T) {
+	t.Parallel()
+
+	config, err := parseConfig(gnrdTs2phcConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	detected := []DetectedInterface{
+		{Name: "enp110s0f0np0", PTPClockDevicePath: "/dev/ptp2"},
+		{Name: "eno8703np0", PTPClockDevicePath: "/dev/ptp0"},
+		{Name: "enp108s0f0np0", PTPClockDevicePath: "/dev/ptp1"},
+	}
+
+	// No GNSS in unit test context; should pick first with ptp_dev (order-dependent)
+	result := applyNmeaMasterPrimary(nil, detected, config)
+
+	primaryCount := 0
+	var primaryName string
+	for _, iface := range result {
+		if iface.Primary {
+			primaryCount++
+			primaryName = iface.Name
+		}
+	}
+	if primaryCount != 1 {
+		t.Fatalf("expected 1 primary, got %d", primaryCount)
+	}
+	if primaryName != "eno8703np0" {
+		t.Fatalf("expected eno8703np0 primary, got %s", primaryName)
+	}
+}

@@ -120,6 +120,7 @@ func parseConfig(contents string) (map[string][]string, error) {
 
 var (
 	ts2phcNotMaster = regexp.MustCompile(`ts2phc.master\s+0`)
+	ts2phcMaster    = regexp.MustCompile(`ts2phc.master\s+1`)
 	ptp4lMasterOnly = regexp.MustCompile(`masterOnly\s+1`)
 	ptp4lServerOnly = regexp.MustCompile(`serverOnly\s+1`)
 	ptpDevicePath   = regexp.MustCompile(`^/dev/ptp[0-9]+$`)
@@ -214,6 +215,79 @@ func netdevExists(ctx clients.ExecContext, interfaceName string) bool {
 	return err == nil
 }
 
+func hasGNSSDevice(ctx clients.ExecContext, interfaceName string) bool {
+	_, _, err := ctx.ExecCommand([]string{"test", "-e", "/sys/class/net/" + interfaceName + "/device/gnss"})
+	return err == nil
+}
+
+func sectionHasTs2phcMaster(lines []string) bool {
+	for _, l := range lines {
+		if ts2phcMaster.MatchString(l) {
+			return true
+		}
+	}
+	return false
+}
+
+func nmeaSectionIsMaster(config map[string][]string) bool {
+	lines, ok := config["nmea"]
+	if !ok {
+		return false
+	}
+	return sectionHasTs2phcMaster(lines)
+}
+
+// applyNmeaMasterPrimary handles GNRD-style profiles where ts2phc.master 1 is on
+// [nmea] and all netdev sections are ts2phc.master 0 (extts/DPLL slaves).
+func applyNmeaMasterPrimary(ctx clients.ExecContext, detected []DetectedInterface, config map[string][]string) []DetectedInterface {
+	if !nmeaSectionIsMaster(config) || len(detected) == 0 {
+		return detected
+	}
+
+	primaryIface := ""
+	if ctx != nil {
+		for _, iface := range detected {
+			if !hasGNSSDevice(ctx, iface.Name) {
+				continue
+			}
+			if primaryIface == "" || iface.Name < primaryIface {
+				primaryIface = iface.Name
+			}
+		}
+	}
+
+	if primaryIface == "" {
+		for _, iface := range detected {
+			if iface.PTPClockDevicePath == "" {
+				continue
+			}
+			if primaryIface == "" || iface.Name < primaryIface {
+				primaryIface = iface.Name
+			}
+		}
+	}
+
+	if primaryIface == "" {
+		primaryIface = detected[0].Name
+		for _, iface := range detected[1:] {
+			if iface.Name < primaryIface {
+				primaryIface = iface.Name
+			}
+		}
+	}
+
+	for i := range detected {
+		detected[i].Primary = detected[i].Name == primaryIface
+	}
+
+	log.Infof(
+		"ts2phc master is [nmea]; marking %q as primary (GNSS netdev for GM collection)",
+		primaryIface,
+	)
+
+	return detected
+}
+
 func appendDetectedInterface(
 	detected []DetectedInterface,
 	ctx clients.ExecContext,
@@ -252,9 +326,14 @@ func appendDetectedInterface(
 
 func getDetectedInterfaces(ctx clients.ExecContext, config map[string][]string) []DetectedInterface {
 	detected := []DetectedInterface{}
+	nmeaMaster := nmeaSectionIsMaster(config)
 
 	for section, lines := range config {
 		detected = appendDetectedInterface(detected, ctx, section, lines, func(ls []string) bool {
+			if nmeaMaster {
+				// netdev sections are extts slaves; primary is chosen after detection
+				return false
+			}
 			for _, l := range ls {
 				if ts2phcNotMaster.MatchString(l) {
 					return false
@@ -263,6 +342,8 @@ func getDetectedInterfaces(ctx clients.ExecContext, config map[string][]string) 
 			return true
 		})
 	}
+
+	detected = applyNmeaMasterPrimary(ctx, detected, config)
 
 	return sortAndDeduplicateInterfaces(detected)
 }
@@ -388,7 +469,18 @@ func checkTs2PhcConfig(ctx clients.ExecContext) ([]DetectedInterface, error) { /
 	detected = sortAndDeduplicateInterfaces(detected)
 	if len(detected) == 0 {
 		errs = append(errs, errors.New("no PTP-capable interfaces detected from ts2phc config"))
+	} else if !hasPrimaryInterface(detected) {
+		errs = append(errs, errors.New("no primary interface detected from ts2phc config"))
 	}
 
 	return detected, utils.MakeCompositeError("", errs) //nolint:wrapcheck //this just combines errors.
+}
+
+func hasPrimaryInterface(detected []DetectedInterface) bool {
+	for _, iface := range detected {
+		if iface.Primary {
+			return true
+		}
+	}
+	return false
 }
