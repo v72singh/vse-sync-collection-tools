@@ -28,7 +28,7 @@ var states = map[string]string{
 }
 
 const (
-	maxNetlinkPinProbe = 32
+	maxNetlinkPinProbe = 64
 
 	OnePPSLabel = "GNSS-1PPS"
 	SMA1Label   = "SMA1"
@@ -192,9 +192,19 @@ func buildPostProcessDPLLNetlink(clockID uint64) fetcher.PostProcessFuncType {
 		processedResult := make(map[string]any)
 
 		entries := make([]NetlinkStateEntry, 0)
-		err := json.Unmarshal([]byte(result["dpll-netlink-device"]), &entries)
-		if err != nil {
-			log.Errorf("Failed to unmarshal netlink device output: %s", err.Error())
+		deviceOut := strings.TrimSpace(result["dpll-netlink-device"])
+		if deviceOut != "" && deviceOut[0] == '[' {
+			err := json.Unmarshal([]byte(deviceOut), &entries)
+			if err != nil {
+				log.Errorf("Failed to unmarshal netlink device output: %s", err.Error())
+			}
+		} else if deviceOut != "" {
+			var entry NetlinkStateEntry
+			if err := json.Unmarshal([]byte(deviceOut), &entry); err != nil {
+				log.Errorf("Failed to unmarshal netlink device output: %s", err.Error())
+			} else {
+				entries = append(entries, entry)
+			}
 		}
 
 		log.Debug("entries: ", entries)
@@ -209,7 +219,7 @@ func buildPostProcessDPLLNetlink(clockID uint64) fetcher.PostProcessFuncType {
 			}
 		}
 		pin := NetlinkPin{}
-		err = json.Unmarshal([]byte(result["dpll-netlink-offset"]), &pin)
+		err := json.Unmarshal([]byte(result["dpll-netlink-offset"]), &pin)
 		if err != nil {
 			log.Errorf("Failed to unmarshal netlink pin output: %s", err.Error())
 		}
@@ -234,8 +244,11 @@ func BuildDPLLNetlinkDeviceFetcher(params NetlinkParameters) error { //nolint:du
 		[]fetcher.AddCommandArgs{
 			{
 				Key: "dpll-netlink-device",
-				Command: "/linux/tools/net/ynl/cli.py --spec /linux/Documentation/netlink/specs/dpll.yaml --dump device-get | " +
-					"python3 /root/custom_scripts/json_encoder.py",
+				// device-get dump fails on GNRD (KeyError: 12); try per-device queries.
+				Command: "sh -c 'for i in 0 1 2 3; do OUT=$(/linux/tools/net/ynl/cli.py --spec " +
+					"/linux/Documentation/netlink/specs/dpll.yaml --do device-get --json " +
+					"\"{\\\"id\\\": $i}\" 2>/dev/null | python3 /root/custom_scripts/json_encoder.py); " +
+					"if [ -n \"$OUT\" ]; then echo \"$OUT\"; break; fi; done'",
 				Trim: true,
 			},
 			{
@@ -286,9 +299,11 @@ func BuildNetlinkInfoFetcher(interfaceName string) error {
 		[]fetcher.AddCommandArgs{
 			{
 				Key: "dpll-netlink-clock-id",
+				// Bash $((16#...)) overflows to negative int64 on E825; use Python for uint64.
 				Command: fmt.Sprintf(
 					`export IFNAME=%s; export BUSID=$(readlink /sys/class/net/$IFNAME/device | xargs basename | cut -d ':' -f 2,3);`+
-						` echo $(("16#$(lspci -v | grep $BUSID -A 20 |grep 'Serial Number' | awk '{print $NF}' | tr -d '-')"))`,
+						` export SERIAL=$(lspci -v | grep "$BUSID" -A20 | grep 'Serial Number' | awk '{print $NF}');`+
+						` python3 -c "import os; s=os.environ.get('SERIAL','').replace('-',''); print(int(s,16) if s else 0)"`,
 					interfaceName,
 				),
 				Trim: true,
@@ -312,9 +327,9 @@ func netlinkPinGetCommand(pinID int32) string {
 	)
 }
 
-// discoverNetlinkPins queries pins individually. A full "pin-get" dump fails on
-// GNRD E830 when the kernel exposes attributes newer than the ynl spec in dpll-debug.
-func discoverNetlinkPins(ctx clients.ExecContext, clockID uint64) ([]*NetlinkPin, error) {
+// probeAllNetlinkPins queries each pin id; full pin-get/device-get dumps fail on GNRD
+// (ynl spec in dpll-debug:0.5 is older than the host kernel).
+func probeAllNetlinkPins(ctx clients.ExecContext) []*NetlinkPin {
 	pins := make([]*NetlinkPin, 0)
 	command := []string{"/usr/bin/sh"}
 
@@ -330,9 +345,50 @@ func discoverNetlinkPins(ctx clients.ExecContext, clockID uint64) ([]*NetlinkPin
 			log.Debugf("skip netlink pin %d: %v", pinID, jsonErr)
 			continue
 		}
+		pins = append(pins, pin)
+	}
+	return pins
+}
+
+func filterPinsByClockID(pins []*NetlinkPin, clockID uint64) []*NetlinkPin {
+	matched := make([]*NetlinkPin, 0)
+	for _, pin := range pins {
 		if pin.ClockID == clockID {
-			pins = append(pins, pin)
+			matched = append(matched, pin)
 		}
+	}
+	return matched
+}
+
+func filterIceNetlinkPins(pins []*NetlinkPin) []*NetlinkPin {
+	matched := make([]*NetlinkPin, 0)
+	for _, pin := range pins {
+		if pin.ModuleName == "ice" {
+			matched = append(matched, pin)
+		}
+	}
+	return matched
+}
+
+// discoverNetlinkPins queries pins individually. A full "pin-get" dump fails on
+// GNRD E830 when the kernel exposes attributes newer than the ynl spec in dpll-debug.
+func discoverNetlinkPins(ctx clients.ExecContext, clockID uint64) ([]*NetlinkPin, error) {
+	allPins := probeAllNetlinkPins(ctx)
+	if len(allPins) == 0 {
+		return nil, fmt.Errorf("no netlink pins responded (dpll-debug ynl may not match kernel)")
+	}
+
+	pins := filterPinsByClockID(allPins, clockID)
+	if len(pins) == 0 {
+		seen := make([]uint64, 0, len(allPins))
+		for _, pin := range allPins {
+			seen = append(seen, pin.ClockID)
+		}
+		log.Warnf(
+			"no pins with clock-id %d; probe saw clock-ids %v — using ice driver pins",
+			clockID, seen,
+		)
+		pins = filterIceNetlinkPins(allPins)
 	}
 	if len(pins) == 0 {
 		return pins, fmt.Errorf("no netlink pins found for clock-id %d", clockID)
@@ -369,10 +425,6 @@ func selectPin(entries []*NetlinkPin, clockID uint64) (int32, string, error) { /
 
 	log.Debug("entries: ", entries)
 	for _, pin := range entries {
-		if pin.ClockID != clockID {
-			continue
-		}
-
 		switch pin.Label {
 		case OnePPSLabel:
 			OnePPSPin = pin
@@ -388,9 +440,20 @@ func selectPin(entries []*NetlinkPin, clockID uint64) (int32, string, error) { /
 		return SMA1Pin.ID, SMA1Label, nil
 	}
 
+	// GNRD E830: ts2phc uses pin_index 1 on each netdev.
+	for _, pin := range entries {
+		if pin.ID == 1 && pinParentsConnected(pin) {
+			label := pin.Label
+			if label == "" {
+				label = "pin-1"
+			}
+			return pin.ID, label, nil
+		}
+	}
+
 	// E830 / GNRD may use different board labels; use any connected pin on this clock.
 	for _, pin := range entries {
-		if pin.ClockID == clockID && pinParentsConnected(pin) {
+		if pinParentsConnected(pin) {
 			label := pin.Label
 			if label == "" {
 				label = fmt.Sprintf("pin-%d", pin.ID)
@@ -401,11 +464,31 @@ func selectPin(entries []*NetlinkPin, clockID uint64) (int32, string, error) { /
 	return 0, "", errors.New("failed to determin correct offset pin")
 }
 
+func parseNetlinkClockID(raw string) (uint64, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return 0, errors.New("empty clock id")
+	}
+	// Bash $((16#...)) returns a signed int64; large PCI serials overflow and appear negative.
+	if strings.HasPrefix(raw, "-") {
+		signed, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil {
+			return 0, fmt.Errorf("failed to parse signed clock id: %w", err)
+		}
+		return uint64(signed), nil
+	}
+	clockID, err := strconv.ParseUint(raw, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("failed to parse clock id: %w", err)
+	}
+	return clockID, nil
+}
+
 func postProcessDPLLNetlinkClockID(result map[string]string) (map[string]any, error) {
 	processedResult := make(map[string]any)
-	clockID, err := strconv.ParseUint(result["dpll-netlink-clock-id"], 10, 64)
+	clockID, err := parseNetlinkClockID(result["dpll-netlink-clock-id"])
 	if err != nil {
-		return processedResult, fmt.Errorf("failed to parse int for clock id: %w", err)
+		return processedResult, err
 	}
 	processedResult["clockID"] = clockID
 	return processedResult, nil

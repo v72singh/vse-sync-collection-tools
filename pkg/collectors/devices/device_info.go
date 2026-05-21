@@ -125,8 +125,11 @@ func getGNSSSCommand(ctx clients.ExecContext, interfaceName string) (*clients.Cm
 	buf := bytes.Buffer{}
 	buf.WriteString(cmdStr)
 	stdout, _, err := ctx.ExecCommandStdIn([]string{"/usr/bin/sh"}, buf)
-	if err != nil || stdout == "" {
+	if err != nil {
 		return nil, fmt.Errorf("command to find gnss devices: %w", err)
+	}
+	if strings.TrimSpace(stdout) == "" {
+		return nil, errors.New("no gnss device under sysfs for interface")
 	}
 	gnssCmd, err := clients.NewCmd("gnss", cmdStr)
 	if err != nil {
