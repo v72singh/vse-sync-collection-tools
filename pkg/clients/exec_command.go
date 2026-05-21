@@ -23,6 +23,7 @@ import (
 const (
 	startTimeoutDefault    = 5 * time.Second
 	deletionTimeoutDefault = 10 * time.Minute
+	linuxptpDaemonPrefix   = "linuxptp-daemon-"
 )
 
 type ExecContext interface {
@@ -189,6 +190,49 @@ type Volume struct {
 	MountPath    string
 }
 
+// applyPTPPullCredentials copies ServiceAccount and imagePullSecrets from a running
+// linuxptp-daemon pod so dpll-debug pulls with the same Quay credentials as the operator.
+func (c *ContainerCreationExecContext) applyPTPPullCredentials(pod *corev1.Pod) {
+	listOpts := metav1.ListOptions{}
+	if c.nodeName != "" {
+		listOpts.FieldSelector = fields.OneTermEqualSelector("spec.nodeName", c.nodeName).String()
+	}
+
+	pods, err := c.clientset.K8sClient.CoreV1().Pods(c.namespace).List(context.TODO(), listOpts)
+	if err != nil {
+		log.Warnf("could not list pods to inherit pull credentials: %v", err)
+		return
+	}
+
+	for i := range pods.Items {
+		ref := &pods.Items[i]
+		if !strings.HasPrefix(ref.Name, linuxptpDaemonPrefix) || strings.HasSuffix(ref.Name, "-debug") {
+			continue
+		}
+		if ref.Status.Phase != corev1.PodRunning && ref.Status.Phase != corev1.PodPending {
+			continue
+		}
+
+		if ref.Spec.ServiceAccountName != "" {
+			pod.Spec.ServiceAccountName = ref.Spec.ServiceAccountName
+		}
+		if len(ref.Spec.ImagePullSecrets) > 0 {
+			pod.Spec.ImagePullSecrets = ref.Spec.ImagePullSecrets
+		}
+
+		log.Infof(
+			"inherited pull credentials for %s from %s (serviceAccount=%q, imagePullSecrets=%d)",
+			c.podName,
+			ref.Name,
+			pod.Spec.ServiceAccountName,
+			len(pod.Spec.ImagePullSecrets),
+		)
+		return
+	}
+
+	log.Warnf("no linuxptp-daemon pod found in %s to inherit pull credentials; using namespace default", c.namespace)
+}
+
 func (c *ContainerCreationExecContext) createPod() error {
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
@@ -210,6 +254,8 @@ func (c *ContainerCreationExecContext) createPod() error {
 	if c.nodeName != "" {
 		pod.Spec.NodeName = c.nodeName
 	}
+
+	c.applyPTPPullCredentials(pod)
 
 	if len(c.command) > 0 {
 		pod.Spec.Containers[0].Command = c.command
