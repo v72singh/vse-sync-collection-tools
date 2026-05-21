@@ -80,7 +80,7 @@ func (runner *CollectorRunner) initialise( //nolint:funlen // allow a slightly l
 		if errors.As(err, &missingRequirements) {
 			// Requirements are missing so don't add the collector to collectorInstance
 			// so that it doesn't get ran
-			log.Warning(err.Error())
+			log.Debug(err.Error())
 		} else {
 			utils.IfErrorExitOrPanic(err)
 			runner.collectorInstances[collectorName] = newCollector
@@ -182,7 +182,7 @@ func (runner *CollectorRunner) start() {
 		err := collector.Start()
 		var missingRequirements *utils.RequirementsNotMetError
 		if errors.As(err, &missingRequirements) {
-			log.Warning(err.Error())
+			log.Debug(err.Error())
 			delete(runner.collectorInstances, collectorName)
 			continue
 		}
@@ -239,7 +239,7 @@ func (runner *CollectorRunner) Run( //nolint:funlen // allow a slightly long fun
 		case pollRes := <-runner.pollResults:
 			log.Infof("Received %v", pollRes)
 			if len(pollRes.Errors) > 0 {
-				log.Warnf("Poll %s had issues: %v. Will retry next poll", pollRes.CollectorName, pollRes.Errors)
+				log.Debugf("Poll %s had issues: %v. Will retry next poll", pollRes.CollectorName, pollRes.Errors)
 				// If erroredPolls blocks it could cause pollResults to fill and
 				// block the execution of the collectors.
 				runner.erroredPolls <- pollRes

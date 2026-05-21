@@ -129,7 +129,7 @@ func getGNSSSCommand(ctx clients.ExecContext, interfaceName string) (*clients.Cm
 		return nil, fmt.Errorf("command to find gnss devices: %w", err)
 	}
 	if strings.TrimSpace(stdout) == "" {
-		return nil, errors.New("no gnss device under sysfs for interface")
+		return nil, errors.New("no GNSS device under NIC sysfs (expected when GNSS is via NMEA/gpsd, not per-port sysfs)")
 	}
 	gnssCmd, err := clients.NewCmd("gnss", cmdStr)
 	if err != nil {
@@ -145,7 +145,7 @@ func BuildPTPDeviceInfo(ctx clients.ExecContext, interfaceName string) error { /
 	commands := []*clients.Cmd{dateCmd}
 	gnssCmd, err := getGNSSSCommand(ctx, interfaceName)
 	if err != nil {
-		log.Warn(err)
+		log.Debug(err)
 	} else {
 		commands = append(commands, gnssCmd)
 	}
