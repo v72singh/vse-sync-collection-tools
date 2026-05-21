@@ -180,6 +180,12 @@ func (runner *CollectorRunner) start() {
 		collector := runner.collectorInstances[collectorName]
 		log.Debugf("start collector %v", collector)
 		err := collector.Start()
+		var missingRequirements *utils.RequirementsNotMetError
+		if errors.As(err, &missingRequirements) {
+			log.Warning(err.Error())
+			delete(runner.collectorInstances, collectorName)
+			continue
+		}
 		utils.IfErrorExitOrPanic(err)
 
 		log.Debugf("Spawning  collector: %v", collector)

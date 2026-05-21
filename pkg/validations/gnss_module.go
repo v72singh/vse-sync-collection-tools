@@ -4,6 +4,7 @@ package validations
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/redhat-partner-solutions/vse-sync-collection-tools/pkg/collectors/devices"
 	"github.com/redhat-partner-solutions/vse-sync-collection-tools/pkg/utils"
@@ -20,7 +21,8 @@ type GNSSModule struct {
 }
 
 func (gnssModule *GNSSModule) Verify() error {
-	if gnssModule.Module != expectedModuleName {
+	// GNRD and newer modules report variants such as ZED-F9T-20B.
+	if !strings.HasPrefix(gnssModule.Module, expectedModuleName) {
 		return utils.NewInvalidEnvError(
 			fmt.Errorf("reported gnss module is not %s", expectedModuleName),
 		)

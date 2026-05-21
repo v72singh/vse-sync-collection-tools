@@ -118,7 +118,10 @@ func processGNSSPath(s string) (string, error) {
 }
 
 func getGNSSSCommand(ctx clients.ExecContext, interfaceName string) (*clients.Cmd, error) {
-	cmdStr := fmt.Sprintf("ls /sys/class/net/%s/device/gnss/", interfaceName)
+	cmdStr := fmt.Sprintf(
+		"sh -c 'ls /sys/class/net/%s/device/gnss/ 2>/dev/null || true'",
+		interfaceName,
+	)
 	buf := bytes.Buffer{}
 	buf.WriteString(cmdStr)
 	stdout, _, err := ctx.ExecCommandStdIn([]string{"/usr/bin/sh"}, buf)

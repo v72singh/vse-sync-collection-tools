@@ -35,7 +35,22 @@ func NewDPLLFilesystemCollector(constructor *CollectionConstructor) (Collector, 
 	if err != nil {
 		return &DPLLFilesystemCollector{}, fmt.Errorf("failed to create DPLLFilesystemCollector: %w", err)
 	}
-	err = devices.BuildFilesystemDPLLInfoFetcher(constructor.PTPInterface)
+	return newDPLLFilesystemCollector(constructor, ctx)
+}
+
+// NewDPLLFilesystemCollectorHost uses the debug pod context (host sysfs) for E830 / GNRD slaves.
+func NewDPLLFilesystemCollectorHost(
+	constructor *CollectionConstructor,
+	ctx clients.ExecContext,
+) (Collector, error) {
+	return newDPLLFilesystemCollector(constructor, ctx)
+}
+
+func newDPLLFilesystemCollector(
+	constructor *CollectionConstructor,
+	ctx clients.ExecContext,
+) (Collector, error) {
+	err := devices.BuildFilesystemDPLLInfoFetcher(constructor.PTPInterface)
 	if err != nil {
 		return &DPLLFilesystemCollector{}, fmt.Errorf("failed to build fetcher for DPLLInfo %w", err)
 	}

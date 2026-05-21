@@ -3,11 +3,13 @@
 package devices
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
 	"strconv"
+	"strings"
 
 	log "github.com/sirupsen/logrus"
 
@@ -26,6 +28,8 @@ var states = map[string]string{
 }
 
 const (
+	maxNetlinkPinProbe = 32
+
 	OnePPSLabel = "GNSS-1PPS"
 	SMA1Label   = "SMA1"
 	SMA2Label   = "SMA2"
@@ -289,12 +293,6 @@ func BuildNetlinkInfoFetcher(interfaceName string) error {
 				),
 				Trim: true,
 			},
-			{
-				Key: "dpll-netlink-pins",
-				Command: "/linux/tools/net/ynl/cli.py --spec /linux/Documentation/netlink/specs/dpll.yaml --dump pin-get | " +
-					"python3 /root/custom_scripts/json_encoder.py",
-				Trim: true,
-			},
 		},
 	)
 	if err != nil {
@@ -306,13 +304,67 @@ func BuildNetlinkInfoFetcher(interfaceName string) error {
 	return nil
 }
 
-func selectPin(pinsJSON []byte, clockID uint64) (int32, string, error) { //nolint:funlen,gocritic,cyclop // allow slightly longer function for sake of readability
-	entries := make([]*NetlinkPin, 0)
-	err := json.Unmarshal(pinsJSON, &entries)
-	if err != nil {
-		return 0, "", fmt.Errorf("failed to unmarshal netlink output: %s", err.Error())
-	}
+func netlinkPinGetCommand(pinID int32) string {
+	return fmt.Sprintf(
+		"/linux/tools/net/ynl/cli.py --spec /linux/Documentation/netlink/specs/dpll.yaml "+
+			`--do pin-get --json '{"id": %d}' 2>/dev/null | python3 /root/custom_scripts/json_encoder.py`,
+		pinID,
+	)
+}
 
+// discoverNetlinkPins queries pins individually. A full "pin-get" dump fails on
+// GNRD E830 when the kernel exposes attributes newer than the ynl spec in dpll-debug.
+func discoverNetlinkPins(ctx clients.ExecContext, clockID uint64) ([]*NetlinkPin, error) {
+	pins := make([]*NetlinkPin, 0)
+	command := []string{"/usr/bin/sh"}
+
+	for pinID := int32(0); pinID < maxNetlinkPinProbe; pinID++ {
+		var buffIn bytes.Buffer
+		buffIn.WriteString(netlinkPinGetCommand(pinID))
+		stdout, _, err := ctx.ExecCommandStdIn(command, buffIn)
+		if err != nil || strings.TrimSpace(stdout) == "" {
+			continue
+		}
+		pin := &NetlinkPin{}
+		if jsonErr := json.Unmarshal([]byte(stdout), pin); jsonErr != nil {
+			log.Debugf("skip netlink pin %d: %v", pinID, jsonErr)
+			continue
+		}
+		if pin.ClockID == clockID {
+			pins = append(pins, pin)
+		}
+	}
+	if len(pins) == 0 {
+		return pins, fmt.Errorf("no netlink pins found for clock-id %d", clockID)
+	}
+	return pins, nil
+}
+
+func pinParentsConnected(pin *NetlinkPin) bool {
+	if pin == nil {
+		return false
+	}
+	for _, parentDev := range pin.ParentDevices {
+		if parentDev.State != ConnectedState {
+			return false
+		}
+	}
+	return len(pin.ParentDevices) > 0
+}
+
+func pinSMA1InputConnected(pin *NetlinkPin) bool {
+	if pin == nil {
+		return false
+	}
+	for _, parentDev := range pin.ParentDevices {
+		if parentDev.Direction != InputDirection || parentDev.State != ConnectedState {
+			return false
+		}
+	}
+	return len(pin.ParentDevices) > 0
+}
+
+func selectPin(entries []*NetlinkPin, clockID uint64) (int32, string, error) { //nolint:funlen,gocritic,cyclop // allow slightly longer function for sake of readability
 	var OnePPSPin, SMA1Pin *NetlinkPin
 
 	log.Debug("entries: ", entries)
@@ -329,28 +381,22 @@ func selectPin(pinsJSON []byte, clockID uint64) (int32, string, error) { //nolin
 		}
 	}
 
-	choosePPS := true
-	for _, parentDev := range OnePPSPin.ParentDevices {
-		if parentDev.State != ConnectedState {
-			choosePPS = false
-			break
-		}
-	}
-
-	chooseSMA1 := true
-	for _, parentDev := range SMA1Pin.ParentDevices {
-		if parentDev.Direction != InputDirection || parentDev.State != ConnectedState {
-			chooseSMA1 = false
-			break
-		}
-	}
-
-	//nolint:gocritic // this is clearer
-	if choosePPS {
+	if pinParentsConnected(OnePPSPin) {
 		return OnePPSPin.ID, OnePPSLabel, nil
 	}
-	if chooseSMA1 {
+	if pinSMA1InputConnected(SMA1Pin) {
 		return SMA1Pin.ID, SMA1Label, nil
+	}
+
+	// E830 / GNRD may use different board labels; use any connected pin on this clock.
+	for _, pin := range entries {
+		if pin.ClockID == clockID && pinParentsConnected(pin) {
+			label := pin.Label
+			if label == "" {
+				label = fmt.Sprintf("pin-%d", pin.ID)
+			}
+			return pin.ID, label, nil
+		}
 	}
 	return 0, "", errors.New("failed to determin correct offset pin")
 }
@@ -362,14 +408,6 @@ func postProcessDPLLNetlinkClockID(result map[string]string) (map[string]any, er
 		return processedResult, fmt.Errorf("failed to parse int for clock id: %w", err)
 	}
 	processedResult["clockID"] = clockID
-
-	offsetPintID, pinType, err := selectPin([]byte(result["dpll-netlink-pins"]), clockID)
-	if err != nil {
-		return processedResult, err
-	}
-
-	processedResult["offsetPin"] = offsetPintID
-	processedResult["pinType"] = pinType
 	return processedResult, nil
 }
 
@@ -378,6 +416,11 @@ type NetlinkParameters struct {
 	PinType   string `fetcherKey:"pinType"   json:"pinType"`
 	ClockID   uint64 `fetcherKey:"clockID"   json:"clockId"`
 	OffsetPin int32  `fetcherKey:"offsetPin" json:"offsetPin"`
+}
+
+type netlinkClockIDInfo struct {
+	Timestamp string `fetcherKey:"date"     json:"timestamp"`
+	ClockID   uint64 `fetcherKey:"clockID"  json:"clockId"`
 }
 
 func GetNetlinkParameters(ctx clients.ExecContext, interfaceName string) (NetlinkParameters, error) {
@@ -393,10 +436,26 @@ func GetNetlinkParameters(ctx clients.ExecContext, interfaceName string) (Netlin
 			return netlinkInfo, errors.New("failed to create fetcher for DPLLInfo using netlink interface")
 		}
 	}
-	err := fetcherInst.Fetch(ctx, &netlinkInfo)
+	clockInfo := netlinkClockIDInfo{}
+	err := fetcherInst.Fetch(ctx, &clockInfo)
 	if err != nil {
-		log.Debugf("failed to fetch netlink info %s", err.Error())
-		return netlinkInfo, fmt.Errorf("failed to fetch netlink info %w", err)
+		log.Debugf("failed to fetch netlink clock id %s", err.Error())
+		return netlinkInfo, fmt.Errorf("failed to fetch netlink clock id %w", err)
 	}
-	return netlinkInfo, nil
+
+	pins, err := discoverNetlinkPins(ctx, clockInfo.ClockID)
+	if err != nil {
+		return netlinkInfo, err
+	}
+	offsetPin, pinType, err := selectPin(pins, clockInfo.ClockID)
+	if err != nil {
+		return netlinkInfo, err
+	}
+
+	return NetlinkParameters{
+		Timestamp: clockInfo.Timestamp,
+		PinType:   pinType,
+		ClockID:   clockInfo.ClockID,
+		OffsetPin: offsetPin,
+	}, nil
 }

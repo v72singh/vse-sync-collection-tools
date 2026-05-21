@@ -38,7 +38,10 @@ func (dpll *DPLLNetlinkCollector) Start() error {
 	log.Debug("dpll.ctx: ", dpll.ctx)
 	netlinkParams, err := devices.GetNetlinkParameters(dpll.ctx, dpll.interfaceName)
 	if err != nil {
-		return fmt.Errorf("dpll netlink collector failed to find clock id: %w", err)
+		log.Warnf("dpll netlink unavailable for %s: %v", dpll.interfaceName, err)
+		return utils.NewRequirementsNotMetError(
+			fmt.Errorf("dpll netlink collector failed for %s: %w", dpll.interfaceName, err),
+		)
 	}
 	log.Debug("clockIDStuct.ClockID: ", netlinkParams.ClockID)
 	err = devices.BuildDPLLNetlinkDeviceFetcher(netlinkParams)
