@@ -261,6 +261,11 @@ func processUBX(result map[string]string) (map[string]any, error) { //nolint:fun
 		processedResult[key] = value
 	}
 
+	_, hasNavStatus := processedResult["navStatus"]
+	_, hasNavClock := processedResult["navClock"]
+	if hasNavStatus && hasNavClock {
+		return processedResult, nil
+	}
 	if len(errors) > 0 {
 		return processedResult,
 			fmt.Errorf(
@@ -268,7 +273,7 @@ func processUBX(result map[string]string) (map[string]any, error) { //nolint:fun
 				utils.MakeCompositeError("", errors),
 			)
 	}
-	return processedResult, nil
+	return processedResult, fmt.Errorf("missing required UBX NAV status or clock data")
 }
 
 // GetGPSNav returns GPSNav of the host
