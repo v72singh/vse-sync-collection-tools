@@ -42,7 +42,7 @@ var _ = Describe("GetGPSNav", func() {
 			expectedInput := "echo '<UBXMonVer>';ubxtool -t -p MON-VER -P 29.20;echo '</UBXMonVer>';"
 			expectedInput += "echo '<UBXVersion>';ubxtool -V;echo '</UBXVersion>';"
 			expectedInput += "echo '<GPSDVersion>';gpsd --version;echo '</GPSDVersion>';"
-			expectedInput += "echo '<GNSSDevices>';ls -1 /dev | grep gnss;echo '</GNSSDevices>';"
+			expectedInput += "echo '<GNSSDevices>';sh -c 'for d in /dev/gnss*; do [ -e \"$d\" ] && basename \"$d\"; done; [ -e /gpsd/data ] && echo /gpsd/data';echo '</GNSSDevices>';"
 
 			expectedOutput := strings.Join([]string{
 				"<UBXMonVer>",

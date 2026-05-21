@@ -86,9 +86,11 @@ func init() {
 				Trim:    true,
 			},
 			{
-				Key:     "GNSSDevices",
-				Command: "ls -1 /dev | grep gnss", // using grep so we just get an empty string if there is nothing
-				Trim:    true,
+				Key: "GNSSDevices",
+				// grep exits 2 when there is no match, which fails the whole fetcher.
+				// GNRD ts2phc uses ts2phc.nmea_serialport /gpsd/data instead of /dev/gnss*.
+				Command: `sh -c 'for d in /dev/gnss*; do [ -e "$d" ] && basename "$d"; done; [ -e /gpsd/data ] && echo /gpsd/data'`,
+				Trim: true,
 			},
 		},
 	)
@@ -169,9 +171,14 @@ func processGPSVer(result map[string]string) (map[string]any, error) {
 	gnssDevices := make([]string, 0)
 	for _, dev := range strings.Split(result["GNSSDevices"], "\n") {
 		dev = strings.TrimSpace(dev)
-		if len(dev) > 0 {
-			gnssDevices = append(gnssDevices, "/dev/"+dev)
+		if dev == "" {
+			continue
 		}
+		if strings.Contains(dev, "/") {
+			gnssDevices = append(gnssDevices, dev)
+			continue
+		}
+		gnssDevices = append(gnssDevices, "/dev/"+dev)
 	}
 	processedResult["GNSSDevices"] = gnssDevices
 	return processedResult, nil

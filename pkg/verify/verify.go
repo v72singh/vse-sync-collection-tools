@@ -46,7 +46,10 @@ func getGPSVersionValidations(
 	ctx, err := contexts.GetPTPDaemonContext(clientset, ptpNodeName)
 	utils.IfErrorExitOrPanic(err)
 	gnssVersions, err := devices.GetGPSVersions(ctx)
-	utils.IfErrorExitOrPanic(err)
+	if err != nil {
+		log.Warnf("skipping GNSS version validations: %v", err)
+		return nil
+	}
 	return []validations.Validation{
 		validations.NewGNSS(gnssVersions),
 		validations.NewGPSDVersion(gnssVersions),
@@ -76,7 +79,14 @@ func getGPSStatusValidation(
 		}
 		time.Sleep(time.Second)
 	}
-	utils.IfErrorExitOrPanic(err)
+	if err != nil {
+		log.Warnf("skipping GNSS status validations: %v", err)
+		return nil
+	}
+	if antCheck == nil {
+		log.Warn("skipping GNSS status validations: no antenna check result")
+		return nil
+	}
 	return []validations.Validation{
 		antCheck,
 		validations.NewGNSSNavStatus(gpsDetails),

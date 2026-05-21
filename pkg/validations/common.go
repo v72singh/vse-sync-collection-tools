@@ -44,12 +44,44 @@ type VersionCheck struct {
 	order        int    `json:"-"`
 }
 
-func (verCheck *VersionCheck) Verify() error {
-	ver := fmt.Sprintf("v%s", strings.ReplaceAll(verCheck.checkVersion, "_", "-"))
-	if !semver.IsValid(ver) {
-		return fmt.Errorf("could not parse version %s", ver)
+func nicFirmwareSemver(checkVersion string) (string, error) {
+	ver := fmt.Sprintf("v%s", strings.ReplaceAll(checkVersion, "_", "-"))
+	if semver.IsValid(ver) {
+		return ver, nil
 	}
-	if semver.Compare(ver, fmt.Sprintf("v%s", verCheck.MinVersion)) < 0 {
+	// ice reports two-part versions such as 4.03; golang semver rejects v4.03 (leading zero).
+	parts := strings.Split(checkVersion, ".")
+	if len(parts) < 2 {
+		return "", fmt.Errorf("could not parse version %s", ver)
+	}
+	minor := strings.TrimLeft(parts[1], "0")
+	if minor == "" {
+		minor = "0"
+	}
+	patch := "0"
+	if len(parts) > 2 {
+		patch = parts[2]
+	}
+	ver = fmt.Sprintf("v%s.%s.%s", parts[0], minor, patch)
+	if !semver.IsValid(ver) {
+		return "", fmt.Errorf("could not parse version %s", ver)
+	}
+	return ver, nil
+}
+
+func (verCheck *VersionCheck) Verify() error {
+	ver, err := nicFirmwareSemver(verCheck.checkVersion)
+	if err != nil {
+		return err
+	}
+	minVer, err := nicFirmwareSemver(verCheck.MinVersion)
+	if err != nil {
+		minVer = fmt.Sprintf("v%s", verCheck.MinVersion)
+		if !semver.IsValid(minVer) {
+			return err
+		}
+	}
+	if semver.Compare(ver, minVer) < 0 {
 		return utils.NewInvalidEnvError(
 			fmt.Errorf("unexpected version: %s < %s", verCheck.checkVersion, verCheck.MinVersion),
 		)
