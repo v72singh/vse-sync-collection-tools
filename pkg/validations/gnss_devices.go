@@ -11,7 +11,7 @@ import (
 
 const (
 	hadGNSSDevices            = TGMSyncEnvPath + "/gnss/device-detected/wpc/"
-	hadGNSSDevicesDescription = "Has GNSS Devices"
+	hadGNSSDevicesDescription = "Verify GNSS device detection"
 )
 
 type GNSDevices struct {
@@ -22,6 +22,7 @@ func (gnssDevices *GNSDevices) Verify() error {
 	if len(gnssDevices.Paths) == 0 {
 		return utils.NewInvalidEnvError(errors.New("no gnss devices found"))
 	}
+
 	return nil
 }
 

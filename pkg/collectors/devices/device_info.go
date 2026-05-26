@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"maps"
 	"regexp"
 	"strings"
 	"time"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/redhat-partner-solutions/vse-sync-collection-tools/pkg/callbacks"
 	"github.com/redhat-partner-solutions/vse-sync-collection-tools/pkg/clients"
+	"github.com/redhat-partner-solutions/vse-sync-collection-tools/pkg/constants"
 	"github.com/redhat-partner-solutions/vse-sync-collection-tools/pkg/fetcher"
 )
 
@@ -35,6 +37,7 @@ func (ptpDevInfo *PTPDeviceInfo) GetAnalyserFormat() ([]*callbacks.AnalyserForma
 	if gnssDev == "" {
 		gnssDev = notFound
 	}
+
 	formatted := callbacks.AnalyserFormatType{
 		ID: "devInfo",
 		Data: map[string]any{
@@ -47,6 +50,7 @@ func (ptpDevInfo *PTPDeviceInfo) GetAnalyserFormat() ([]*callbacks.AnalyserForma
 			"driverVersion":     ptpDevInfo.DriverVersion,
 		},
 	}
+
 	return []*callbacks.AnalyserFormatType{&formatted}, nil
 }
 
@@ -75,16 +79,20 @@ func init() {
 
 func extractOffsetFromTimestamp(result map[string]string) (map[string]any, error) {
 	processedResult := make(map[string]any, 0)
+
 	timestamp, err := time.Parse(time.RFC3339Nano, result["date"])
 	if err != nil {
 		return processedResult, fmt.Errorf("failed to parse timestamp  %w", err)
 	}
+
 	processedResult["timeOffset"] = time.Since(timestamp)
+
 	return processedResult, nil
 }
 
 func extractEthtoolsInfo(result map[string]string) (map[string]any, error) {
 	processedResult := make(map[string]any, 0)
+
 	match := ethtoolRegex.FindStringSubmatch(result["ethtoolOut"])
 	if len(match) == 0 {
 		return processedResult, fmt.Errorf(
@@ -92,8 +100,10 @@ func extractEthtoolsInfo(result map[string]string) (map[string]any, error) {
 			result["ethtoolOut"],
 		)
 	}
+
 	processedResult["driverVersion"] = match[1]
 	processedResult["firmwareVersion"] = match[2]
+
 	return processedResult, nil
 }
 
@@ -102,14 +112,14 @@ func devInfoPostProcessor(result map[string]string) (map[string]any, error) {
 	if err != nil {
 		return processedResult, err
 	}
+
 	firmwareResult, err := extractEthtoolsInfo(result)
 	if err != nil {
 		return processedResult, err
 	}
 
-	for key, value := range firmwareResult {
-		processedResult[key] = value
-	}
+	maps.Copy(processedResult, firmwareResult)
+
 	return processedResult, nil
 }
 
@@ -121,27 +131,35 @@ func getGNSSSCommand(ctx clients.ExecContext, interfaceName string) (*clients.Cm
 	cmdStr := fmt.Sprintf("ls /sys/class/net/%s/device/gnss/", interfaceName)
 	buf := bytes.Buffer{}
 	buf.WriteString(cmdStr)
+
 	stdout, _, err := ctx.ExecCommandStdIn([]string{"/usr/bin/sh"}, buf)
 	if err != nil || stdout == "" {
 		return nil, fmt.Errorf("command to find gnss devices: %w", err)
 	}
+
 	gnssCmd, err := clients.NewCmd("gnss", cmdStr)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create gnss command for interface %s: %w", interfaceName, err)
 	}
+
 	gnssCmd.SetOutputProcessor(processGNSSPath)
+
 	return gnssCmd, nil
 }
 
 // BuildPTPDeviceInfo popluates the fetcher required for
 // collecting the PTPDeviceInfo
-func BuildPTPDeviceInfo(ctx clients.ExecContext, interfaceName string) error { //nolint:dupl // Further dedup risks be too abstract or fragile
+func BuildPTPDeviceInfo(ctx clients.ExecContext, interfaceName string, clockType string) error { //nolint:dupl // Further dedup risks be too abstract or fragile
 	commands := []*clients.Cmd{dateCmd}
-	gnssCmd, err := getGNSSSCommand(ctx, interfaceName)
-	if err != nil {
-		log.Warn(err)
-	} else {
-		commands = append(commands, gnssCmd)
+
+	// Only include GNSS command for GM (Grand Master) clock type, skip for BC (Boundary Clock)
+	if clockType == constants.ClockTypeGM {
+		gnssCmd, err := getGNSSSCommand(ctx, interfaceName)
+		if err != nil {
+			log.Warn(err)
+		} else {
+			commands = append(commands, gnssCmd)
+		}
 	}
 
 	fetcherInst, err := fetcher.FetcherFactory(
@@ -159,7 +177,7 @@ func BuildPTPDeviceInfo(ctx clients.ExecContext, interfaceName string) error { /
 			},
 			{
 				Key:     "ethtoolOut",
-				Command: fmt.Sprintf("ethtool -i %s", interfaceName),
+				Command: "ethtool -i " + interfaceName,
 				Trim:    true,
 			},
 		},
@@ -168,21 +186,24 @@ func BuildPTPDeviceInfo(ctx clients.ExecContext, interfaceName string) error { /
 		log.Errorf("failed to create fetcher for devInfo: %s", err.Error())
 		return fmt.Errorf("failed to create fetcher for devInfo: %w", err)
 	}
+
 	devFetcher[interfaceName] = fetcherInst
 	fetcherInst.SetPostProcessor(devInfoPostProcessor)
+
 	return nil
 }
 
 // GetPTPDeviceInfo returns the PTPDeviceInfo for an interface
-func GetPTPDeviceInfo(interfaceName string, ctx clients.ExecContext) (*PTPDeviceInfo, error) {
+func GetPTPDeviceInfo(interfaceName string, ctx clients.ExecContext, clockType string) (*PTPDeviceInfo, error) {
 	devInfo := &PTPDeviceInfo{}
 	// Find the dev for the GNSS for this interface
 	fetcherInst, fetchedInstanceOk := devFetcher[interfaceName]
 	if !fetchedInstanceOk {
-		err := BuildPTPDeviceInfo(ctx, interfaceName)
+		err := BuildPTPDeviceInfo(ctx, interfaceName, clockType)
 		if err != nil {
 			return devInfo, err
 		}
+
 		fetcherInst, fetchedInstanceOk = devFetcher[interfaceName]
 		if !fetchedInstanceOk {
 			return devInfo, errors.New("failed to create fetcher for PTPDeviceInfo")
@@ -194,5 +215,6 @@ func GetPTPDeviceInfo(interfaceName string, ctx clients.ExecContext) (*PTPDevice
 		log.Debugf("failed to fetch devInfo %s", err.Error())
 		return devInfo, fmt.Errorf("failed to fetch devInfo %w", err)
 	}
+
 	return devInfo, nil
 }

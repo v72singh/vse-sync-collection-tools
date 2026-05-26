@@ -10,12 +10,13 @@ import (
 
 const (
 	gpsdID          = TGMEnvVerPath + "/gpsd/"
-	gpsdDescription = "GPSD Version is valid"
+	gpsdDescription = "Verify GPSD version"
 	MinGSPDVersion  = "3.25"
 )
 
 func NewGPSDVersion(gpsdVer *devices.GPSVersions) *VersionCheck {
 	parts := strings.Split(gpsdVer.GPSDVersion, " ")
+
 	return &VersionCheck{
 		id:           gpsdID,
 		Version:      gpsdVer.GPSDVersion,

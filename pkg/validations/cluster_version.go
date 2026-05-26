@@ -17,8 +17,9 @@ import (
 )
 
 const (
-	clusterVersionID  = TGMEnvVerPath + "/RHOCP/"
-	MinClusterVersion = "4.14.0-0" // trailing -0 is required to allow preGA version
+	clusterVersionID          = TGMEnvVerPath + "/RHOCP/"
+	clusterVersionDescription = "Verify RHOCP cluster version"
+	MinClusterVersion         = "4.14.0-0" // trailing -0 is required to allow preGA version
 )
 
 type Status struct {
@@ -42,6 +43,7 @@ func getClusterVersion(
 		Version:  version,
 		Resource: resource,
 	}
+
 	list, err := dynamicClient.Resource(resourceID).
 		List(context.Background(), metav1.ListOptions{})
 	if err != nil {
@@ -51,18 +53,22 @@ func getClusterVersion(
 	for _, item := range list.Items {
 		value := item.Object["status"]
 		status := &Status{}
+
 		marsh, err := json.Marshal(value)
 		if err != nil {
 			log.Debug("failed to marshal cluster version status", err)
 			continue
 		}
+
 		err = json.Unmarshal(marsh, status)
 		if err != nil {
 			log.Debug("failed to marshal cluster version status", err)
 			continue
 		}
+
 		return status.Desired.Version, nil
 	}
+
 	return "", errors.New("failed to find PTP Operator CSV")
 }
 
@@ -73,12 +79,14 @@ func NewClusterVersion(client *clients.Clientset) *VersionWithErrorCheck {
 		"clusterversions",
 		client,
 	)
+
 	return &VersionWithErrorCheck{
 		VersionCheck: VersionCheck{
 			id:           clusterVersionID,
 			Version:      version,
 			checkVersion: version,
 			MinVersion:   MinClusterVersion,
+			description:  clusterVersionDescription,
 			order:        clusterVersionOrdering,
 		},
 		Error: err,

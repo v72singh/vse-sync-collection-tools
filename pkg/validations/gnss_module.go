@@ -12,7 +12,7 @@ import (
 const (
 	expectedModuleName             = "ZED-F9T"
 	gnssModuleIsCorrect            = TGMEnvModelPath + "/gnss/"
-	gnssModuleIsCorrectDescription = "GNSS module is valid"
+	gnssModuleIsCorrectDescription = "Verify GNSS module model"
 )
 
 type GNSSModule struct {
@@ -25,6 +25,7 @@ func (gnssModule *GNSSModule) Verify() error {
 			fmt.Errorf("reported gnss module is not %s", expectedModuleName),
 		)
 	}
+
 	return nil
 }
 

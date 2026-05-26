@@ -4,8 +4,10 @@ package devices_test
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"net/url"
+	"strings"
 	"testing"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -17,6 +19,7 @@ import (
 
 	"github.com/redhat-partner-solutions/vse-sync-collection-tools/pkg/clients"
 	"github.com/redhat-partner-solutions/vse-sync-collection-tools/pkg/collectors/devices"
+	"github.com/redhat-partner-solutions/vse-sync-collection-tools/pkg/constants"
 	"github.com/redhat-partner-solutions/vse-sync-collection-tools/testutils"
 )
 
@@ -61,14 +64,16 @@ var _ = Describe("NewContainerContext", func() {
 			reader := bufio.NewReader(options.Stdin)
 			cmd := ""
 			keepReading := true
+			var cmdSb65 strings.Builder
 			for keepReading {
 				line, prefix, _ := reader.ReadLine()
 				keepReading = prefix
-				cmd += string(line)
+				cmdSb65.WriteString(string(line))
 			}
+			cmd += cmdSb65.String()
 			resp, ok := response[cmd]
 			if !ok {
-				return []byte(resp.stdout), []byte(resp.stderr), fmt.Errorf("Response not found")
+				return []byte(resp.stdout), []byte(resp.stderr), errors.New("Response not found")
 			}
 			return []byte(resp.stdout), []byte(resp.stderr), resp.err
 		}
@@ -77,7 +82,7 @@ var _ = Describe("NewContainerContext", func() {
 	})
 
 	When("called GetPTPDeviceInfo", func() {
-		It("should return a valid PTPDeviceInfo", func() {
+		It("should return a valid DeviceInfo for GM clock type", func() {
 			vendor := "0x8086"
 			devID := "0x1593"
 			gnssDev := "gnss0"
@@ -102,7 +107,7 @@ var _ = Describe("NewContainerContext", func() {
 
 			ctx, err := clients.NewContainerContext(clientset, "TestNamespace", "Test", "TestContainer", "TestNodeName")
 			Expect(err).NotTo(HaveOccurred())
-			info, err := devices.GetPTPDeviceInfo("aFakeInterface", ctx)
+			info, err := devices.GetPTPDeviceInfo("aFakeInterface", ctx, constants.ClockTypeGM)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(info.Timestamp).To(Equal("2023-06-16T11:49:47.0584Z"))
 			Expect(info.DeviceID).To(Equal(devID))
@@ -110,17 +115,16 @@ var _ = Describe("NewContainerContext", func() {
 			Expect(info.GNSSDev).To(Equal("/dev/" + gnssDev))
 			Expect(info.FirmwareVersion).To(Equal(firmwareVersion))
 			Expect(info.DriverVersion).To(Equal(driverVersion))
+
 		})
 	})
 
-	When("called GetPTPDeviceInfo but theres no GNSS", func() {
-		It("should return a vaild GetPTPDeviceInfo with no GNSS entry", func() {
+	When("called GetPTPDeviceInfo with BC clock type", func() {
+		It("should return a valid DeviceInfo without GNSS for BC", func() {
 			vendor := "0x8086"
 			devID := "0x1593"
 			firmwareVersion := "4.20 0x8001778b 1.3346.0"
 			driverVersion := "1.11.20.7"
-
-			response["ls /sys/class/net/aFakeInterface/device/gnss/"] = Response{err: fmt.Errorf("Not found")}
 
 			expectedInput := "echo '<date>';date +%s.%N;echo '</date>';"
 			expectedInput += "echo '<devID>';cat /sys/class/net/aFakeInterface/device/device;echo '</devID>';"
@@ -136,7 +140,7 @@ var _ = Describe("NewContainerContext", func() {
 
 			ctx, err := clients.NewContainerContext(clientset, "TestNamespace", "Test", "TestContainer", "TestNodeName")
 			Expect(err).NotTo(HaveOccurred())
-			info, err := devices.GetPTPDeviceInfo("aFakeInterface", ctx)
+			info, err := devices.GetPTPDeviceInfo("aFakeInterface", ctx, constants.ClockTypeBC)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(info.Timestamp).To(Equal("2023-06-16T11:49:47.0584Z"))
 			Expect(info.DeviceID).To(Equal(devID))
@@ -144,6 +148,42 @@ var _ = Describe("NewContainerContext", func() {
 			Expect(info.GNSSDev).To(Equal(""))
 			Expect(info.FirmwareVersion).To(Equal(firmwareVersion))
 			Expect(info.DriverVersion).To(Equal(driverVersion))
+
+		})
+	})
+
+	When("called GetPTPDeviceInfo with GM but GNSS fails", func() {
+		It("should return a valid DeviceInfo with empty GNSS when GNSS command fails", func() {
+			vendor := "0x8086"
+			devID := "0x1593"
+			firmwareVersion := "4.20 0x8001778b 1.3346.0"
+			driverVersion := "1.11.20.7"
+
+			response["ls /sys/class/net/aFakeInterface/device/gnss/"] = Response{err: errors.New("Not found")}
+
+			expectedInput := "echo '<date>';date +%s.%N;echo '</date>';"
+			expectedInput += "echo '<devID>';cat /sys/class/net/aFakeInterface/device/device;echo '</devID>';"
+			expectedInput += "echo '<vendorID>';cat /sys/class/net/aFakeInterface/device/vendor;echo '</vendorID>';"
+			expectedInput += "echo '<ethtoolOut>';ethtool -i aFakeInterface;echo '</ethtoolOut>';"
+
+			expectedOutput := "<date>\n1686916187.0584\n</date>\n"
+			expectedOutput += fmt.Sprintf("<devID>\n%s\n</devID>\n", devID)
+			expectedOutput += fmt.Sprintf("<vendorID>\n%s\n</vendorID>\n", vendor)
+			expectedOutput += fmt.Sprintf(ethtoolOutput, driverVersion, firmwareVersion)
+
+			response[expectedInput] = Response{stdout: expectedOutput}
+
+			ctx, err := clients.NewContainerContext(clientset, "TestNamespace", "Test", "TestContainer", "TestNodeName")
+			Expect(err).NotTo(HaveOccurred())
+			info, err := devices.GetPTPDeviceInfo("aFakeInterface", ctx, constants.ClockTypeGM)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(info.Timestamp).To(Equal("2023-06-16T11:49:47.0584Z"))
+			Expect(info.DeviceID).To(Equal(devID))
+			Expect(info.VendorID).To(Equal(vendor))
+			Expect(info.GNSSDev).To(Equal(""))
+			Expect(info.FirmwareVersion).To(Equal(firmwareVersion))
+			Expect(info.DriverVersion).To(Equal(driverVersion))
+
 		})
 	})
 })

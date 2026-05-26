@@ -10,7 +10,7 @@ import (
 
 const (
 	gnssID          = TGMEnvVerPath + "/gnss-firmware/"
-	gnssDescription = "GNSS Version is valid"
+	gnssDescription = "Verify GNSS firmware version"
 )
 
 var (
@@ -19,6 +19,7 @@ var (
 
 func NewGNSS(gnss *devices.GPSVersions) *VersionCheck {
 	parts := strings.Split(gnss.FirmwareVersion, " ")
+
 	return &VersionCheck{
 		id:           gnssID,
 		Version:      gnss.FirmwareVersion,

@@ -12,7 +12,7 @@ import (
 const (
 	expectedAntStatus        = 2
 	gnssAntStatusID          = TGMSyncEnvPath + "/gnss/antenna-connected/wpc/"
-	gnssAntStatusDescription = "GNSS Module is connected to an antenna"
+	gnssAntStatusDescription = "Verify GNSS antenna connection status"
 )
 
 type GNSSAntStatus struct {
@@ -25,6 +25,7 @@ func (gnssAnt *GNSSAntStatus) Verify() error {
 			return nil
 		}
 	}
+
 	return utils.NewInvalidEnvError(errors.New("no GNSS antenna connected"))
 }
 
