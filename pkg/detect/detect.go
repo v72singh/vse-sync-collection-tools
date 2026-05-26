@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 
 	log "github.com/sirupsen/logrus"
@@ -74,18 +75,74 @@ func parseConfig(contents string) (map[string][]string, error) {
 
 var notMaster = regexp.MustCompile(`ts2phc.master\s+0`)
 
+func parsePTPClockIndexFromEthtool(out string) (int, error) {
+	hasRawHWClock := strings.Contains(out, "hardware-raw-clock")
+
+	for _, line := range strings.Split(out, "\n") {
+		if !strings.Contains(line, "PTP Hardware Clock:") {
+			continue
+		}
+		clockNumber := strings.TrimSpace(strings.SplitN(line, ":", 2)[1])
+		if clockNumber == "" || clockNumber == "none" {
+			return 0, errors.New("interface has no PTP hardware clock")
+		}
+		idx, err := strconv.Atoi(clockNumber)
+		if err != nil {
+			return 0, fmt.Errorf("invalid PTP hardware clock index %q: %w", clockNumber, err)
+		}
+		return idx, nil
+	}
+
+	if hasRawHWClock {
+		for _, line := range strings.Split(out, "\n") {
+			if !strings.Contains(line, "Hardware timestamp provider index:") {
+				continue
+			}
+			clockNumber := strings.TrimSpace(strings.SplitN(line, ":", 2)[1])
+			idx, err := strconv.Atoi(clockNumber)
+			if err != nil {
+				return 0, fmt.Errorf("invalid hardware timestamp provider index %q: %w", clockNumber, err)
+			}
+			return idx, nil
+		}
+	}
+
+	return 0, errors.New("no PTP clock device found")
+}
+
+func getPTPClockDeviceFromSysfs(ctx clients.ExecContext, interfaceName string) (string, error) {
+	script := fmt.Sprintf(
+		`ptp=$(ls /sys/class/net/%s/device/ptp/ptp* 2>/dev/null | head -1); [ -n "$ptp" ] && basename "$ptp"`,
+		interfaceName,
+	)
+	out, _, err := ctx.ExecCommand([]string{"sh", "-c", script})
+	if err != nil {
+		return "", err
+	}
+	ptpName := strings.TrimSpace(out)
+	if ptpName == "" {
+		return "", errors.New("no PTP clock device found under sysfs")
+	}
+	return "/dev/" + ptpName, nil
+}
+
 func getPTPClockDevice(ctx clients.ExecContext, interfaceName string) (string, error) {
 	out, _, err := ctx.ExecCommand([]string{"ethtool", "-T", interfaceName})
 	if err != nil {
 		return "", fmt.Errorf("failed to get ptp clock number: %w", err)
 	}
-	for _, line := range strings.Split(out, "\n") {
-		if strings.Contains(line, "PTP Hardware Clock:") {
-			clockNumber := strings.TrimSpace(strings.Split(line, ":")[1])
-			return fmt.Sprintf("/dev/ptp%s", clockNumber), nil
-		}
+
+	idx, err := parsePTPClockIndexFromEthtool(out)
+	if err == nil {
+		return fmt.Sprintf("/dev/ptp%d", idx), nil
 	}
-	return "", errors.New("no PTP clock device found")
+
+	ptpDev, sysfsErr := getPTPClockDeviceFromSysfs(ctx, interfaceName)
+	if sysfsErr == nil {
+		return ptpDev, nil
+	}
+
+	return "", fmt.Errorf("%w (sysfs lookup also failed: %v)", err, sysfsErr)
 }
 
 func getDetectedInterfaces(ctx clients.ExecContext, config map[string][]string) []DetectedInterface {
