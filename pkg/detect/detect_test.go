@@ -50,11 +50,7 @@ func TestParsePTPClockIndexFromEthtool(t *testing.T) {
 	}{
 		{name: "legacy phc index", out: legacyEthtoolTsInfo, want: 0},
 		{name: "provider index fallback", out: providerEthtoolTsInfo, want: 0},
-		{
-			name:    "provider without raw hardware clock",
-			out:     "Hardware timestamp provider index: 0\n",
-			wantErr: true,
-		},
+		{name: "provider index only", out: "Hardware timestamp provider index: 0\n", want: 0},
 		{
 			name: "no phc",
 			out: `Capabilities:

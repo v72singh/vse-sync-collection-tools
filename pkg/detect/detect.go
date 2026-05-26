@@ -75,34 +75,33 @@ func parseConfig(contents string) (map[string][]string, error) {
 
 var notMaster = regexp.MustCompile(`ts2phc.master\s+0`)
 
-func parsePTPClockIndexFromEthtool(out string) (int, error) {
-	hasRawHWClock := strings.Contains(out, "hardware-raw-clock")
+func parsePTPClockIndexLine(line, label string) (int, error) {
+	if !strings.Contains(line, label) {
+		return 0, errors.New("line does not match label")
+	}
+	clockNumber := strings.TrimSpace(strings.SplitN(line, ":", 2)[1])
+	if clockNumber == "" || clockNumber == "none" {
+		return 0, errors.New("interface has no PTP hardware clock")
+	}
+	idx, err := strconv.Atoi(clockNumber)
+	if err != nil {
+		return 0, fmt.Errorf("invalid %s %q: %w", label, clockNumber, err)
+	}
+	return idx, nil
+}
 
+func parsePTPClockIndexFromEthtool(out string) (int, error) {
 	for _, line := range strings.Split(out, "\n") {
-		if !strings.Contains(line, "PTP Hardware Clock:") {
-			continue
+		idx, err := parsePTPClockIndexLine(line, "PTP Hardware Clock:")
+		if err == nil {
+			return idx, nil
 		}
-		clockNumber := strings.TrimSpace(strings.SplitN(line, ":", 2)[1])
-		if clockNumber == "" || clockNumber == "none" {
-			return 0, errors.New("interface has no PTP hardware clock")
-		}
-		idx, err := strconv.Atoi(clockNumber)
-		if err != nil {
-			return 0, fmt.Errorf("invalid PTP hardware clock index %q: %w", clockNumber, err)
-		}
-		return idx, nil
 	}
 
-	if hasRawHWClock {
-		for _, line := range strings.Split(out, "\n") {
-			if !strings.Contains(line, "Hardware timestamp provider index:") {
-				continue
-			}
-			clockNumber := strings.TrimSpace(strings.SplitN(line, ":", 2)[1])
-			idx, err := strconv.Atoi(clockNumber)
-			if err != nil {
-				return 0, fmt.Errorf("invalid hardware timestamp provider index %q: %w", clockNumber, err)
-			}
+	// Newer ethtool reports PHC via provider index (e.g. Samsung/Mellanox NICs).
+	for _, line := range strings.Split(out, "\n") {
+		idx, err := parsePTPClockIndexLine(line, "Hardware timestamp provider index:")
+		if err == nil {
 			return idx, nil
 		}
 	}
@@ -112,7 +111,8 @@ func parsePTPClockIndexFromEthtool(out string) (int, error) {
 
 func getPTPClockDeviceFromSysfs(ctx clients.ExecContext, interfaceName string) (string, error) {
 	script := fmt.Sprintf(
-		`ptp=$(ls /sys/class/net/%s/device/ptp/ptp* 2>/dev/null | head -1); [ -n "$ptp" ] && basename "$ptp"`,
+		`ptp=$(ls /sys/class/net/%[1]s/device/ptp/ptp* /sys/class/net/%[1]s/ptp/ptp* 2>/dev/null | head -1); `+
+			`if [ -n "$ptp" ]; then basename "$ptp"; fi`,
 		interfaceName,
 	)
 	out, _, err := ctx.ExecCommand([]string{"sh", "-c", script})
@@ -128,13 +128,12 @@ func getPTPClockDeviceFromSysfs(ctx clients.ExecContext, interfaceName string) (
 
 func getPTPClockDevice(ctx clients.ExecContext, interfaceName string) (string, error) {
 	out, _, err := ctx.ExecCommand([]string{"ethtool", "-T", interfaceName})
-	if err != nil {
-		return "", fmt.Errorf("failed to get ptp clock number: %w", err)
-	}
-
-	idx, err := parsePTPClockIndexFromEthtool(out)
 	if err == nil {
-		return fmt.Sprintf("/dev/ptp%d", idx), nil
+		idx, parseErr := parsePTPClockIndexFromEthtool(out)
+		if parseErr == nil {
+			return fmt.Sprintf("/dev/ptp%d", idx), nil
+		}
+		err = parseErr
 	}
 
 	ptpDev, sysfsErr := getPTPClockDeviceFromSysfs(ctx, interfaceName)
